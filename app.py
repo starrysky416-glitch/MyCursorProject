@@ -1,4 +1,4 @@
-"""교사 월별 업무 정돈 웹 앱 — Streamlit 뼈대."""
+"""교사 월별 업무 정돈 및 관리 웹 앱."""
 
 from __future__ import annotations
 
@@ -77,9 +77,9 @@ SAMPLE_TITLES = """\
 졸업식·종업식 운영 계획
 """.strip()
 
-TABLE_COLUMNS = ["할 일", "공문 제목", "분류 근거", "상태"]
+# '분류 근거' 제거, 3개 컬럼으로 정돈
+TABLE_COLUMNS = ["할 일", "작년 공문 제목", "상태"]
 UNCLASSIFIED_MONTH_LABEL = "미분류"
-USER_ASSIGN_REASON = "사용자 지정"
 
 
 def academic_year_start(today: date | None = None) -> int:
@@ -94,10 +94,30 @@ def month_tab_label(month: int, year_start: int) -> str:
 
 def split_titles(raw: str) -> list[str]:
     lines: list[str] = []
-    for chunk in re.split(r"[\n\r;]+", raw):
-        title = chunk.strip(" \t-•·*")
-        if title:
-            lines.append(title)
+    for line in re.split(r"[\n\r;]+", raw):
+        line_str = line.strip()
+        if not line_str:
+            continue
+
+        parts = line_str.split("\t")
+        target_month = None
+
+        if len(parts) >= 3:
+            original_title = parts[2].strip()
+
+            if len(parts) >= 5:
+                date_match = re.search(r"\d{4}-(0?[1-9]|1[0-2])-\d{2}", parts[4])
+                if date_match:
+                    target_month = int(date_match.group(1))
+        else:
+            original_title = line_str.strip(" \t-•·*")
+
+        if original_title:
+            if target_month:
+                lines.append(f"[{target_month}월]{original_title}")
+            else:
+                lines.append(original_title)
+
     return lines
 
 
@@ -117,6 +137,12 @@ def months_from_explicit_date(title: str) -> list[int]:
 
 
 def classify_title(title: str) -> list[int]:
+    tag_match = re.match(r"^\[(\d{1,2})월\]", title)
+    if tag_match:
+        month = int(tag_match.group(1))
+        if month in ACADEMIC_MONTHS:
+            return [month]
+
     months = months_from_explicit_date(title)
     if months:
         return months
@@ -130,18 +156,15 @@ def classify_title(title: str) -> list[int]:
     return matched
 
 
-def title_to_todo(title: str) -> str:
-    cleaned = re.sub(r"\s+", " ", title).strip()
-    if len(cleaned) > 48:
-        cleaned = cleaned[:45] + "…"
-    return f"공문 확인 및 후속 조치: {cleaned}"
+def todo_row(raw_title_with_tag: str) -> dict[str, str]:
+    original_title = re.sub(r"^\[\d{1,2}월\]", "", raw_title_with_tag).strip()
+    original_title = re.sub(r"\b발신문서\s*", "", original_title).strip()
 
+    clean_todo = re.sub(r"\d{4}학년도|\d{4}년", "", original_title).strip()
 
-def todo_row(title: str, reason: str) -> dict[str, str]:
     return {
-        "할 일": title_to_todo(title),
-        "공문 제목": title,
-        "분류 근거": reason,
+        "할 일": clean_todo,
+        "작년 공문 제목": original_title,
         "상태": "대기",
     }
 
@@ -172,12 +195,11 @@ def append_title_to_months(
     tables: dict[int, pd.DataFrame],
     title: str,
     months: list[int],
-    reason: str,
 ) -> dict[int, pd.DataFrame]:
     updated = dict(tables)
     for month in months:
         existing = updated[month].reset_index(drop=True)
-        rows = existing.to_dict("records") + [todo_row(title, reason)]
+        rows = existing.to_dict("records") + [todo_row(title)]
         updated[month] = dataframe_from_rows(rows)
     return updated
 
@@ -194,7 +216,7 @@ def build_month_tables(
             unclassified.append(title)
             continue
         for month in months:
-            rows_by_month[month].append(todo_row(title, "제목 키워드/날짜"))
+            rows_by_month[month].append(todo_row(title))
 
     tables = {
         month: dataframe_from_rows(rows_by_month[month]) for month in ACADEMIC_MONTHS
@@ -211,7 +233,7 @@ def unclassified_titles(items: list[dict[str, str]]) -> list[str]:
 
 
 def unclassified_table(titles: list[str]) -> pd.DataFrame:
-    return dataframe_from_rows([todo_row(title, "월 미특정") for title in titles])
+    return dataframe_from_rows([todo_row(title) for title in titles])
 
 
 def combined_download_table(
@@ -261,9 +283,7 @@ def apply_manual_month_choices(
         if not months:
             remaining.append(item)
             continue
-        updated = append_title_to_months(
-            updated, item["title"], months, USER_ASSIGN_REASON
-        )
+        updated = append_title_to_months(updated, item["title"], months)
         moved += 1
     return updated, remaining, moved
 
@@ -284,9 +304,11 @@ def render_unclassified_editor(result: dict) -> None:
         options = month_choice_labels()
         with st.form("manual_classify"):
             for item in items:
-                st.markdown(f"**{item['title']}**")
+                display_title = re.sub(r"^\[\d{1,2}월\]", "", item["title"]).strip()
+                display_title = re.sub(r"\b발신문서\s*", "", display_title).strip()
+                st.markdown(f"**{display_title}**")
                 st.multiselect(
-                    f"{item['title']} 보낼 월",
+                    f"{display_title} 보낼 월",
                     options=options,
                     key=f"manual_months_{item['id']}",
                     placeholder="달을 선택하세요",
@@ -400,7 +422,7 @@ def render_auth_sidebar() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="교사 월별 업무 정돈",
+        page_title="교사 업무 관리 및 정돈",
         page_icon=":material/calendar_month:",
         layout="wide",
     )
@@ -409,12 +431,11 @@ def main() -> None:
 
     render_auth_sidebar()
 
-    st.title(":material/calendar_month: 교사 월별 업무 정돈")
+    st.title(":material/calendar_month: 교사 업무 관리 및 정돈")
     st.write(
         "공문 제목을 붙여넣은 뒤 **월별 업무로 분류하기**를 누르면 "
-        "3월부터 다음 해 2월까지 탭으로 나누어 할 일 표를 보여 줍니다. "
-        "달을 자동으로 못 찾은 제목은 직접 월을 지정할 수 있습니다. "
-        "로그인하면 분류 결과가 저장되어 다음에 다시 불러올 수 있습니다."
+        "3월부터 다음 해 2월까지 탭으로 나누어 업무 표를 보여 줍니다. "
+        "상태를 **'완료'**로 변경하여 업무 수행을 관리할 수 있습니다."
     )
     if auth_flash := st.session_state.pop("auth_flash", None):
         st.success(auth_flash)
@@ -504,20 +525,48 @@ def main() -> None:
         with tab:
             df = tables[month]
             label = month_tab_label(month, year_start)
-            st.subheader(f"{label} 할 일")
-            month_csv = df.reset_index(drop=True) if not df.empty else df
-            st.download_button(
-                label=f"{MONTH_LABELS[month]} CSV 다운로드",
-                data=dataframe_to_csv_bytes(month_csv),
-                file_name=f"교사_월별업무_{year_start}학년도_{MONTH_LABELS[month]}.csv",
-                mime="text/csv",
-                icon=":material/download:",
-                key=f"download_month_{month}",
-            )
+            st.subheader(f"{label} 업무 목록")
+
             if df.empty:
                 render_empty_table()
             else:
-                st.dataframe(df, use_container_width=True)
+                # 데이터 에디터를 통해 상태(대기, 진행 중, 완료) 직접 수정 가능
+                edited_df = st.data_editor(
+                    df,
+                    key=f"editor_month_{month}",
+                    use_container_width=True,
+                    column_config={
+                        "할 일": st.column_config.TextColumn(
+                            "할 일", width="medium"
+                        ),
+                        "작년 공문 제목": st.column_config.TextColumn(
+                            "작년 공문 제목", width="large"  # 작년 공문 제목 넓이 확장
+                        ),
+                        "상태": st.column_config.SelectboxColumn(
+                            "상태",
+                            options=["대기", "진행 중", "완료"],
+                            required=True,
+                            width="small",
+                        ),
+                    },
+                )
+
+                # 수정된 상태 반영 및 세션 저장
+                if not edited_df.equals(df):
+                    result["tables"][month] = edited_df
+                    st.session_state["classified"] = result
+                    persist_classified(result)
+                    st.rerun()
+
+                # 완료 항목 스타일링(취소선/밑줄) 안내 및 CSV 다운로드 버튼
+                st.download_button(
+                    label=f"{MONTH_LABELS[month]} CSV 다운로드",
+                    data=dataframe_to_csv_bytes(edited_df),
+                    file_name=f"교사_월별업무_{year_start}학년도_{MONTH_LABELS[month]}.csv",
+                    mime="text/csv",
+                    icon=":material/download:",
+                    key=f"download_month_{month}",
+                )
 
 
 if __name__ == "__main__":
