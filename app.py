@@ -77,7 +77,6 @@ SAMPLE_TITLES = """\
 졸업식·종업식 운영 계획
 """.strip()
 
-# '분류 근거' 제거, 3개 컬럼으로 정돈
 TABLE_COLUMNS = ["할 일", "작년 공문 제목", "상태"]
 UNCLASSIFIED_MONTH_LABEL = "미분류"
 
@@ -269,71 +268,86 @@ def render_empty_table() -> None:
     st.caption("이 달에 분류된 할 일이 없습니다.")
 
 
-def apply_manual_month_choices(
-    tables: dict[int, pd.DataFrame],
-    items: list[dict[str, str]],
-) -> tuple[dict[int, pd.DataFrame], list[dict[str, str]], int]:
-    remaining: list[dict[str, str]] = []
-    moved = 0
-    updated = tables
-    for item in items:
-        months = months_from_choice_labels(
-            st.session_state.get(f"manual_months_{item['id']}")
-        )
-        if not months:
-            remaining.append(item)
-            continue
-        updated = append_title_to_months(updated, item["title"], months)
-        moved += 1
-    return updated, remaining, moved
-
-
 def render_unclassified_editor(result: dict) -> None:
     items: list[dict[str, str]] = result["unclassified_items"]
     if not items:
         return
 
     with st.expander(
-        f"월을 특정하지 못한 제목 {len(items)}건 — 직접 분류",
+        f"월을 특정하지 못한 제목 {len(items)}건 — 직접 분류 및 삭제",
         expanded=True,
     ):
-        st.write(
-            "자동으로 달을 찾지 못한 공문입니다. 각 제목에 해당 월을 고른 뒤 "
-            "**선택한 달로 보내기**를 누르세요. 여러 달을 함께 고를 수 있습니다."
-        )
+        st.write("자동으로 달을 찾지 못한 공문입니다. 보낼 월을 선택 후 버튼을 누르거나 삭제하세요.")
         options = month_choice_labels()
-        with st.form("manual_classify"):
+
+        deleted_item_id = None
+
+        with st.form("manual_classify_form_clean"):
             for item in items:
                 display_title = re.sub(r"^\[\d{1,2}월\]", "", item["title"]).strip()
                 display_title = re.sub(r"\b발신문서\s*", "", display_title).strip()
-                st.markdown(f"**{display_title}**")
-                st.multiselect(
-                    f"{display_title} 보낼 월",
-                    options=options,
-                    key=f"manual_months_{item['id']}",
-                    placeholder="달을 선택하세요",
-                    label_visibility="collapsed",
-                )
+
+                # 수평 3열 정렬: 공문 제목 | 보낼 월 선택 | 삭제 버튼
+                c1, c2, c3 = st.columns([5, 4, 1], vertical_alignment="bottom")
+                with c1:
+                    st.write(f"**{display_title}**")
+                with c2:
+                    st.multiselect(
+                        "보낼 월",
+                        options=options,
+                        key=f"manual_months_{item['id']}",
+                        placeholder="월 선택",
+                        label_visibility="collapsed",
+                    )
+                with c3:
+                    if st.form_submit_button("🗑️ 삭제", key=f"del_btn_{item['id']}"):
+                        deleted_item_id = item["id"]
+
+            st.write("")
             submitted = st.form_submit_button(
                 "선택한 달로 보내기",
                 type="primary",
                 icon=":material/send:",
+                use_container_width=True,
             )
+
+        # 개별 삭제 처리
+        if deleted_item_id:
+            result["unclassified_items"] = [
+                i for i in result["unclassified_items"] if i["id"] != deleted_item_id
+            ]
+            st.session_state["classified"] = result
+            persist_classified(result)
+            st.session_state["manual_flash"] = "항목을 삭제했습니다."
+            st.rerun()
+
+        # 월 분류 전송 처리
         if submitted:
-            tables, remaining, moved = apply_manual_month_choices(
-                result["tables"], items
-            )
+            tables = result["tables"]
+            remaining = []
+            moved = 0
+
+            for item in items:
+                months = months_from_choice_labels(
+                    st.session_state.get(f"manual_months_{item['id']}")
+                )
+                if not months:
+                    remaining.append(item)
+                    continue
+
+                tables = append_title_to_months(tables, item["title"], months)
+                moved += 1
+
             result["tables"] = tables
             result["unclassified_items"] = remaining
             st.session_state["classified"] = result
+
             if moved:
-                st.session_state["manual_flash"] = (
-                    f"{moved}건을 선택한 달 탭으로 보냈습니다."
-                )
+                st.session_state["manual_flash"] = f"{moved}건을 선택한 달로 보냈습니다."
                 persist_classified(result)
             else:
                 st.session_state["manual_flash_warn"] = (
-                    "달을 고른 제목이 없습니다. 월을 선택한 뒤 다시 눌러 주세요."
+                    "월을 선택한 항목이 없습니다. 달을 고른 후 다시 눌러 주세요."
                 )
             st.rerun()
 
@@ -435,7 +449,7 @@ def main() -> None:
     st.write(
         "공문 제목을 붙여넣은 뒤 **월별 업무로 분류하기**를 누르면 "
         "3월부터 다음 해 2월까지 탭으로 나누어 업무 표를 보여 줍니다. "
-        "상태를 **'완료'**로 변경하여 업무 수행을 관리할 수 있습니다."
+        "상태를 **'✅ 완료'**로 선택하여 업무를 정돈할 수 있습니다."
     )
     if auth_flash := st.session_state.pop("auth_flash", None):
         st.success(auth_flash)
@@ -451,7 +465,7 @@ def main() -> None:
         st.info("왼쪽에서 로그인하면 분류한 업무가 사라지지 않습니다.")
 
     raw_text = st.text_area(
-        "공문 제목 (한 줄에 하나씩 붙여넣기)",
+        "공문 제목 (에듀파인에서 상태~처리유형까지 한 번에 긁어오시면 됩니다)",
         height=220,
         placeholder="공문 제목을 줄바꿈으로 구분해 붙여넣으세요.",
         key="raw_text",
@@ -530,35 +544,28 @@ def main() -> None:
             if df.empty:
                 render_empty_table()
             else:
-                # 데이터 에디터를 통해 상태(대기, 진행 중, 완료) 직접 수정 가능
                 edited_df = st.data_editor(
                     df,
                     key=f"editor_month_{month}",
                     use_container_width=True,
                     column_config={
-                        "할 일": st.column_config.TextColumn(
-                            "할 일", width="medium"
-                        ),
-                        "작년 공문 제목": st.column_config.TextColumn(
-                            "작년 공문 제목", width="large"  # 작년 공문 제목 넓이 확장
-                        ),
+                        "할 일": st.column_config.TextColumn("할 일", width="medium"),
+                        "작년 공문 제목": st.column_config.TextColumn("작년 공문 제목", width="large"),
                         "상태": st.column_config.SelectboxColumn(
                             "상태",
-                            options=["대기", "진행 중", "완료"],
+                            options=["대기", "진행 중", "✅ 완료"],
                             required=True,
                             width="small",
                         ),
                     },
                 )
 
-                # 수정된 상태 반영 및 세션 저장
                 if not edited_df.equals(df):
                     result["tables"][month] = edited_df
                     st.session_state["classified"] = result
                     persist_classified(result)
                     st.rerun()
 
-                # 완료 항목 스타일링(취소선/밑줄) 안내 및 CSV 다운로드 버튼
                 st.download_button(
                     label=f"{MONTH_LABELS[month]} CSV 다운로드",
                     data=dataframe_to_csv_bytes(edited_df),
