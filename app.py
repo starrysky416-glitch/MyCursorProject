@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 import uuid
 from datetime import date
@@ -262,10 +263,100 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def render_empty_table() -> None:
-    empty = pd.DataFrame(columns=TABLE_COLUMNS)
-    st.dataframe(empty, use_container_width=True, hide_index=True)
-    st.caption("이 달에 분류된 할 일이 없습니다.")
+def clear_editor_widget_states() -> None:
+    """Streamlit 위젯 캐시를 제거하여 복구 시 표를 동기화합니다."""
+    for key in list(st.session_state.keys()):
+        if (
+            key.startswith("editor_month_")
+            or key.startswith("manual_months_")
+            or key.startswith("del_btn_")
+        ):
+            del st.session_state[key]
+
+
+def is_same_snapshot(snap1: dict, snap2: dict) -> bool:
+    """판다스 데이터프레임이 포함된 스냅샷 객체 2개가 동일한지 안전하게 비교합니다."""
+    if snap1.keys() != snap2.keys():
+        return False
+    if snap1.get("title_count") != snap2.get("title_count"):
+        return False
+    if snap1.get("unclassified_items") != snap2.get("unclassified_items"):
+        return False
+
+    tables1 = snap1.get("tables", {})
+    tables2 = snap2.get("tables", {})
+    if tables1.keys() != tables2.keys():
+        return False
+
+    for month in tables1:
+        if not tables1[month].equals(tables2[month]):
+            return False
+
+    return True
+
+
+def push_history() -> None:
+    """현재 데이터 상태를 복구용 히스토리에 저장 (ValueError 방지 안전 비교 적용)"""
+    if "classified" in st.session_state:
+        if "history" not in st.session_state:
+            st.session_state["history"] = []
+
+        current_snapshot = copy.deepcopy(st.session_state["classified"])
+
+        # 직전 저장된 히스토리와 동일할 경우 중복 저장 방지
+        if st.session_state["history"]:
+            last_snapshot = st.session_state["history"][-1]
+            if is_same_snapshot(last_snapshot, current_snapshot):
+                return
+
+        st.session_state["history"].append(current_snapshot)
+        if len(st.session_state["history"]) > 20:
+            st.session_state["history"].pop(0)
+
+
+def pop_history() -> None:
+    """이전 상태로 데이터 복구 (Undo)"""
+    if "history" in st.session_state and st.session_state["history"]:
+        st.session_state["classified"] = st.session_state["history"].pop()
+        persist_classified(st.session_state["classified"])
+
+        clear_editor_widget_states()
+
+        st.session_state["manual_flash"] = "이전 상태로 복구(Undo)되었습니다."
+        st.rerun()
+
+
+def run_classification(raw_text: str) -> None:
+    push_history()
+    clear_editor_widget_states()
+    titles = split_titles(raw_text)
+    if not titles:
+        st.warning("분류할 공문 제목이 없습니다. 텍스트를 입력해 주세요.")
+        st.session_state.pop("classified", None)
+    else:
+        tables, unclassified = build_month_tables(titles)
+        result = {
+            "tables": tables,
+            "unclassified_items": new_unclassified_items(unclassified),
+            "title_count": len(titles),
+        }
+        st.session_state["classified"] = result
+        persist_classified(result)
+
+
+@st.dialog("⚠️ 분류 재시행 확인")
+def confirm_reclassify_dialog(raw_text: str) -> None:
+    st.warning("새로 분류를 진행하면 **현재 직접 수정하거나 추가한 월별 업무 내역이 삭제되고 초기화**됩니다.")
+    st.write("정말로 다시 분류하시겠습니까?")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("예, 다시 분류합니다", type="primary", use_container_width=True):
+            run_classification(raw_text)
+            st.rerun()
+    with c2:
+        if st.button("취소", use_container_width=True):
+            st.rerun()
 
 
 def render_unclassified_editor(result: dict) -> None:
@@ -287,7 +378,6 @@ def render_unclassified_editor(result: dict) -> None:
                 display_title = re.sub(r"^\[\d{1,2}월\]", "", item["title"]).strip()
                 display_title = re.sub(r"\b발신문서\s*", "", display_title).strip()
 
-                # 수평 3열 정렬: 공문 제목 | 보낼 월 선택 | 삭제 버튼
                 c1, c2, c3 = st.columns([5, 4, 1], vertical_alignment="bottom")
                 with c1:
                     st.write(f"**{display_title}**")
@@ -311,8 +401,9 @@ def render_unclassified_editor(result: dict) -> None:
                 use_container_width=True,
             )
 
-        # 개별 삭제 처리
         if deleted_item_id:
+            push_history()
+            clear_editor_widget_states()
             result["unclassified_items"] = [
                 i for i in result["unclassified_items"] if i["id"] != deleted_item_id
             ]
@@ -321,8 +412,9 @@ def render_unclassified_editor(result: dict) -> None:
             st.session_state["manual_flash"] = "항목을 삭제했습니다."
             st.rerun()
 
-        # 월 분류 전송 처리
         if submitted:
+            push_history()
+            clear_editor_widget_states()
             tables = result["tables"]
             remaining = []
             moved = 0
@@ -449,7 +541,7 @@ def main() -> None:
     st.write(
         "공문 제목을 붙여넣은 뒤 **월별 업무로 분류하기**를 누르면 "
         "3월부터 다음 해 2월까지 탭으로 나누어 업무 표를 보여 줍니다. "
-        "상태를 **'✅ 완료'**로 선택하여 업무를 정돈할 수 있습니다."
+        "상태를 **'✅ 완료'**로 선택하거나, 직접 항목을 **추가/삭제**할 수 있습니다."
     )
     if auth_flash := st.session_state.pop("auth_flash", None):
         st.success(auth_flash)
@@ -465,7 +557,7 @@ def main() -> None:
         st.info("왼쪽에서 로그인하면 분류한 업무가 사라지지 않습니다.")
 
     raw_text = st.text_area(
-        "공문 제목 (에듀파인에서 상태~처리유형까지 한 번에 긁어오시면 됩니다)",
+        "공문 제목 (한 줄에 하나씩 붙여넣기)",
         height=220,
         placeholder="공문 제목을 줄바꿈으로 구분해 붙여넣으세요.",
         key="raw_text",
@@ -474,19 +566,11 @@ def main() -> None:
     classify_clicked = st.button("월별 업무로 분류하기", type="primary")
 
     if classify_clicked:
-        titles = split_titles(raw_text)
-        if not titles:
-            st.warning("분류할 공문 제목이 없습니다. 텍스트를 입력해 주세요.")
-            st.session_state.pop("classified", None)
+        if "classified" in st.session_state:
+            confirm_reclassify_dialog(raw_text)
         else:
-            tables, unclassified = build_month_tables(titles)
-            result = {
-                "tables": tables,
-                "unclassified_items": new_unclassified_items(unclassified),
-                "title_count": len(titles),
-            }
-            st.session_state["classified"] = result
-            persist_classified(result)
+            run_classification(raw_text)
+            st.rerun()
 
     result = st.session_state.get("classified")
     if not result:
@@ -498,6 +582,7 @@ def main() -> None:
         st.session_state["classified"] = result
 
     year_start = academic_year_start()
+
     st.success(
         f"공문 제목 {result['title_count']}건을 "
         f"{year_start}학년도(3월~{year_start + 1}년 2월) 기준으로 분류했습니다."
@@ -539,41 +624,70 @@ def main() -> None:
         with tab:
             df = tables[month]
             label = month_tab_label(month, year_start)
-            st.subheader(f"{label} 업무 목록")
 
-            if df.empty:
-                render_empty_table()
-            else:
-                edited_df = st.data_editor(
-                    df,
-                    key=f"editor_month_{month}",
+            c_title, c_undo = st.columns([7, 3], vertical_alignment="bottom")
+            with c_title:
+                st.subheader(f"{label} 업무 목록")
+            with c_undo:
+                has_history = "history" in st.session_state and len(st.session_state["history"]) > 0
+                if st.button(
+                    "↩️ 실행 취소 (Undo)",
+                    key=f"undo_btn_month_{month}",
+                    disabled=not has_history,
                     use_container_width=True,
-                    column_config={
-                        "할 일": st.column_config.TextColumn("할 일", width="medium"),
-                        "작년 공문 제목": st.column_config.TextColumn("작년 공문 제목", width="large"),
-                        "상태": st.column_config.SelectboxColumn(
-                            "상태",
-                            options=["대기", "진행 중", "✅ 완료"],
-                            required=True,
-                            width="small",
-                        ),
-                    },
-                )
+                ):
+                    pop_history()
 
-                if not edited_df.equals(df):
-                    result["tables"][month] = edited_df
-                    st.session_state["classified"] = result
-                    persist_classified(result)
-                    st.rerun()
+            st.caption("💡 표 맨 아래 줄에서 새 행을 입력하거나, 좌측 체크박스를 선택하여 행을 삭제할 수 있습니다.")
 
-                st.download_button(
-                    label=f"{MONTH_LABELS[month]} CSV 다운로드",
-                    data=dataframe_to_csv_bytes(edited_df),
-                    file_name=f"교사_월별업무_{year_start}학년도_{MONTH_LABELS[month]}.csv",
-                    mime="text/csv",
-                    icon=":material/download:",
-                    key=f"download_month_{month}",
-                )
+            edited_df = st.data_editor(
+                df,
+                key=f"editor_month_{month}",
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "할 일": st.column_config.TextColumn("할 일", width="medium"),
+                    "작년 공문 제목": st.column_config.TextColumn("작년 공문 제목", width="large", default="-"),
+                    "상태": st.column_config.SelectboxColumn(
+                        "상태",
+                        options=["대기", "진행 중", "✅ 완료"],
+                        default="대기",
+                        required=True,
+                        width="small",
+                    ),
+                },
+            )
+
+            # 빈 행 또는 None 처리된 데이터 클리닝
+            clean_df = edited_df.copy()
+            clean_df = clean_df.dropna(subset=["할 일"])
+            clean_df = clean_df[clean_df["할 일"].astype(str).str.strip() != ""]
+            clean_df = clean_df[clean_df["할 일"].astype(str).str.strip() != "None"]
+
+            if "작년 공문 제목" in clean_df.columns:
+                clean_df["작년 공문 제목"] = clean_df["작년 공문 제목"].fillna("-")
+
+            clean_df = clean_df.reset_index(drop=True)
+            if not clean_df.empty:
+                clean_df.index = range(1, len(clean_df) + 1)
+                clean_df.index.name = "번호"
+
+            # 유효 데이터 변경 시 히스토리 저장 및 갱신
+            if not clean_df.equals(df):
+                push_history()
+                result["tables"][month] = clean_df
+                st.session_state["classified"] = result
+                persist_classified(result)
+                st.rerun()
+
+            st.download_button(
+                label=f"{MONTH_LABELS[month]} CSV 다운로드",
+                data=dataframe_to_csv_bytes(clean_df),
+                file_name=f"교사_월별업무_{year_start}학년도_{MONTH_LABELS[month]}.csv",
+                mime="text/csv",
+                icon=":material/download:",
+                key=f"download_month_{month}",
+            )
 
 
 if __name__ == "__main__":
