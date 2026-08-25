@@ -489,7 +489,12 @@ def render_auth_sidebar() -> None:
                 if not result:
                     st.warning("저장할 분류 결과가 없습니다.")
                 else:
+                    # 저장 버튼을 누르면 그동안 편집한(edited_table) 내용을 원본에 합쳐서 저장
+                    for m in ACADEMIC_MONTHS:
+                        if f"edited_table_{m}" in st.session_state:
+                            result["tables"][m] = st.session_state[f"edited_table_{m}"]
                     persist_classified(result)
+                    clear_editor_widget_states() # 저장 후 깔끔하게 캐시 초기화
                     st.rerun()
             return
 
@@ -595,9 +600,13 @@ def main() -> None:
 
     render_unclassified_editor(result)
 
-    tables: dict[int, pd.DataFrame] = result["tables"]
+# 현재 편집 중인 최신 데이터를 모아서 다운로드 테이블 생성
+    current_tables = {}
+    for m in ACADEMIC_MONTHS:
+        current_tables[m] = st.session_state.get(f"edited_table_{m}", result["tables"][m])
+        
     leftover = unclassified_titles(result["unclassified_items"])
-    combined = combined_download_table(tables, leftover, year_start)
+    combined = combined_download_table(current_tables, leftover, year_start)
 
     st.divider()
     with st.container(border=True):
@@ -620,75 +629,45 @@ def main() -> None:
     tab_labels = [month_tab_label(month, year_start) for month in ACADEMIC_MONTHS]
     tabs = st.tabs(tab_labels)
 
+    tab_labels = [month_tab_label(month, year_start) for month in ACADEMIC_MONTHS]
+    tabs = st.tabs(tab_labels)
+
+    # 🚨 이 부분에 아래 한 줄을 추가해 주세요!
+    tables = result["tables"]
+
     for month, tab in zip(ACADEMIC_MONTHS, tabs):
         with tab:
             df = tables[month]
             label = month_tab_label(month, year_start)
 
-            c_title, c_undo = st.columns([7, 3], vertical_alignment="bottom")
-            with c_title:
-                st.subheader(f"{label} 업무 목록")
-            with c_undo:
-                has_history = "history" in st.session_state and len(st.session_state["history"]) > 0
-                if st.button(
-                    "↩️ 실행 취소 (Undo)",
-                    key=f"undo_btn_month_{month}",
-                    disabled=not has_history,
-                    use_container_width=True,
-                ):
-                    pop_history()
+            st.subheader(f"{label} 업무 목록")
+            st.caption("💡 표 아래 ➕ 기호를 눌러 행을 추가하세요. (실행 취소는 키보드 Ctrl+Z / Mac은 Cmd+Z)")
 
-            st.caption("💡 표 맨 아래 줄에서 새 행을 입력하거나, 좌측 체크박스를 선택하여 행을 삭제할 수 있습니다.")
-
+            # 🚨 원본 df를 그대로 넣고, 나오는 결과(edited_df)를 원본에 덮어씌우지 않습니다!
             edited_df = st.data_editor(
                 df,
                 key=f"editor_month_{month}",
                 use_container_width=True,
                 num_rows="dynamic",
+                hide_index=True,
                 column_config={
-                    "할 일": st.column_config.TextColumn("할 일", width="medium"),
+                    "할 일": st.column_config.TextColumn("할 일", width="medium", required=True, default=""),
                     "작년 공문 제목": st.column_config.TextColumn("작년 공문 제목", width="large", default="-"),
-                    "상태": st.column_config.SelectboxColumn(
-                        "상태",
-                        options=["대기", "진행 중", "✅ 완료"],
-                        default="대기",
-                        required=True,
-                        width="small",
-                    ),
+                    "상태": st.column_config.SelectboxColumn("상태", options=["대기", "진행 중", "✅ 완료"], default="대기", required=True, width="small"),
                 },
             )
 
-            # 빈 행 또는 None 처리된 데이터 클리닝
-            clean_df = edited_df.copy()
-            clean_df = clean_df.dropna(subset=["할 일"])
-            clean_df = clean_df[clean_df["할 일"].astype(str).str.strip() != ""]
-            clean_df = clean_df[clean_df["할 일"].astype(str).str.strip() != "None"]
-
-            if "작년 공문 제목" in clean_df.columns:
-                clean_df["작년 공문 제목"] = clean_df["작년 공문 제목"].fillna("-")
-
-            clean_df = clean_df.reset_index(drop=True)
-            if not clean_df.empty:
-                clean_df.index = range(1, len(clean_df) + 1)
-                clean_df.index.name = "번호"
-
-            # 유효 데이터 변경 시 히스토리 저장 및 갱신
-            if not clean_df.equals(df):
-                push_history()
-                result["tables"][month] = clean_df
-                st.session_state["classified"] = result
-                persist_classified(result)
-                st.rerun()
+            # 편집된 결과를 세션에 따로 보관만 합니다. (실시간 저장을 없애 렉과 글자 날아감 완벽 방지)
+            st.session_state[f"edited_table_{month}"] = edited_df
 
             st.download_button(
                 label=f"{MONTH_LABELS[month]} CSV 다운로드",
-                data=dataframe_to_csv_bytes(clean_df),
+                data=dataframe_to_csv_bytes(edited_df),
                 file_name=f"교사_월별업무_{year_start}학년도_{MONTH_LABELS[month]}.csv",
                 mime="text/csv",
                 icon=":material/download:",
                 key=f"download_month_{month}",
             )
-
 
 if __name__ == "__main__":
     main()
